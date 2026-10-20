@@ -3,3 +3,6 @@ PyPDF2
 python-docx
 google-generativeai
 python-dotenv
+reportlab
+reportlab
+python-dotenv

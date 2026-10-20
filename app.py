@@ -1,189 +1,26 @@
-"""AI-Powered Resume Analyzer.
+"""AI-Powered Resume Analyzer & ATS Intelligence Platform.
 
-A Streamlit app that scores a resume against a job description using the
-Google Gemini API and returns three actionable improvements.
+Main entry point — wires together the document parser, AI analyzer,
+UI components, and PDF report generator.
 
 Run with:
     streamlit run app.py
 """
 
-import io
-import json
 import os
 
-import docx  # provided by the python-docx package
-import google.generativeai as genai
-import PyPDF2
 import streamlit as st
 from dotenv import load_dotenv
+
+from ai_analyzer import analyze_resume
+from document_parser import SUPPORTED_TYPES, extract_text
+from ui_components import render_results
 
 # Load environment variables (e.g. GEMINI_API_KEY) from a local .env file.
 load_dotenv()
 
-MODEL_NAME = "gemini-3.8-flash"
-SUPPORTED_TYPES = ["pdf", "docx", "txt"]
 
-
-# --------------------------------------------------------------------------
-# Document processing
-# --------------------------------------------------------------------------
-def _extract_pdf(file_bytes):
-    """Extract text from PDF bytes using PyPDF2."""
-    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(pages)
-
-
-def _extract_docx(file_bytes):
-    """Extract text from DOCX bytes using python-docx (paragraphs + tables)."""
-    document = docx.Document(io.BytesIO(file_bytes))
-    lines = [para.text for para in document.paragraphs]
-
-    # Resumes often use tables for layout, so include their cell text too.
-    for table in document.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                if cell.text.strip():
-                    lines.append(cell.text)
-    return "\n".join(lines)
-
-
-def _extract_txt(file_bytes):
-    """Decode plain-text bytes, falling back to latin-1 if UTF-8 fails."""
-    try:
-        return file_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return file_bytes.decode("latin-1")
-
-
-def extract_text(uploaded_file):
-    """Detect the file type from its extension and extract its text.
-
-    Args:
-        uploaded_file: Streamlit UploadedFile object (PDF, DOCX or TXT).
-
-    Returns:
-        str: The extracted text.
-
-    Raises:
-        ValueError: If the type is unsupported or no text could be extracted.
-    """
-    extension = os.path.splitext(uploaded_file.name)[1].lower()
-    file_bytes = uploaded_file.getvalue()
-
-    extractors = {
-        ".pdf": _extract_pdf,
-        ".docx": _extract_docx,
-        ".txt": _extract_txt,
-    }
-    if extension not in extractors:
-        raise ValueError(f"Unsupported file type: '{extension}'.")
-
-    try:
-        text = extractors[extension](file_bytes)
-    except Exception as exc:  # corrupt or encrypted files, etc.
-        raise ValueError(f"Could not read the {extension} file: {exc}") from exc
-
-    if not text.strip():
-        raise ValueError(
-            "No text could be extracted. The file may be empty or a scanned image."
-        )
-    return text
-
-
-# --------------------------------------------------------------------------
-# AI integration
-# --------------------------------------------------------------------------
-def build_prompt(resume_text, job_description):
-    """Build the prompt that injects the resume and job description."""
-    return f"""You are a strict, expert technical recruiter. Evaluate the
-candidate's resume against the job description below.
-
-RESUME:
-{resume_text}
-
-JOB DESCRIPTION:
-{job_description}
-
-Respond with ONLY a raw JSON object. Do not use markdown formatting, code
-fences, or any conversational text. The object must contain exactly these
-two keys:
-  "match_score": an integer from 1 to 100 showing how well the resume
-                 matches the job description.
-  "improvements": a list of exactly 3 strings, each a specific, actionable
-                  suggestion for improving the resume for this specific job.
-"""
-
-
-def _strip_code_fences(text):
-    """Remove stray markdown fences and surrounding prose around a JSON object."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
-    return text.strip()
-
-
-def _validate_result(result):
-    """Check the parsed JSON matches the spec and normalise its values."""
-    if not isinstance(result, dict):
-        raise ValueError("The model response was not a JSON object.")
-    if "match_score" not in result or "improvements" not in result:
-        raise ValueError("The model response is missing required keys.")
-
-    score = int(result["match_score"])
-    score = max(1, min(100, score))
-
-    improvements = result["improvements"]
-    if not isinstance(improvements, list) or not improvements:
-        raise ValueError("'improvements' must be a non-empty list.")
-
-    return {
-        "match_score": score,
-        "improvements": [str(item) for item in improvements[:3]],
-    }
-
-
-def analyze_resume(resume_text, job_description, api_key):
-    """Send the resume and job description to Gemini and parse the reply.
-
-    Returns:
-        dict: {"match_score": int, "improvements": list[str]}
-
-    Raises:
-        RuntimeError: On API failures or an unparseable response.
-    """
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            MODEL_NAME,
-            generation_config={
-                "temperature": 0.2,
-                "response_mime_type": "application/json",
-            },
-        )
-        response = model.generate_content(
-            build_prompt(resume_text, job_description)
-        )
-        raw_text = response.text
-    except Exception as exc:  # network, quota, invalid key, blocked content
-        raise RuntimeError(f"Gemini API call failed: {exc}") from exc
-
-    try:
-        parsed = json.loads(_strip_code_fences(raw_text))
-        return _validate_result(parsed)
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        raise RuntimeError(f"Could not parse the model's response: {exc}") from exc
-
-
-# --------------------------------------------------------------------------
-# User interface
-# --------------------------------------------------------------------------
-def get_api_key():
+def _get_api_key():
     """Read the API key from the environment, or ask the user for it."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -194,42 +31,42 @@ def get_api_key():
     return api_key
 
 
-def render_results(result):
-    """Render the score as a metric and the feedback as markdown."""
-    st.success("Analysis complete!")
-    st.metric(label="Match Score", value=f"{result['match_score']}/100")
-    st.progress(result["match_score"] / 100)
-
-    st.subheader("Top 3 Improvements")
-    for index, tip in enumerate(result["improvements"], start=1):
-        st.markdown(f"**{index}.** {tip}")
-
-
 def main():
     """Configure the page and run the analysis workflow."""
     st.set_page_config(
-        page_title="AI Resume Analyzer", page_icon="📄", layout="centered"
+        page_title="AI Resume Analyzer",
+        page_icon="📄",
+        layout="wide",
     )
-    st.title("📄 AI-Powered Resume Analyzer")
+    st.title("📄 AI-Powered Resume Analyzer & ATS Intelligence Platform")
     st.markdown(
-        "Upload your resume and paste a job description. A strict AI "
-        "recruiter will score the match and suggest three concrete "
-        "improvements."
+        "Upload your resume and paste a job description. The AI acts as a "
+        "**strict technical recruiter** — scoring your match, identifying "
+        "skill gaps, rewriting weak bullet points, and generating tailored "
+        "interview prep questions."
     )
 
-    api_key = get_api_key()
+    api_key = _get_api_key()
 
-    st.subheader("1. Upload your resume")
-    uploaded_file = st.file_uploader(
-        "Supported formats: PDF, DOCX, TXT", type=SUPPORTED_TYPES
-    )
+    # ── Input section (two columns) ──
+    col_input1, col_input2 = st.columns(2)
 
-    st.subheader("2. Paste the job description")
-    job_description = st.text_area(
-        "Job description", height=300, placeholder="Paste the full posting here..."
-    )
+    with col_input1:
+        st.subheader("1. Upload your resume")
+        uploaded_file = st.file_uploader(
+            "Supported formats: PDF, DOCX, TXT", type=SUPPORTED_TYPES
+        )
 
-    if st.button("Analyze Match", type="primary"):
+    with col_input2:
+        st.subheader("2. Paste the job description")
+        job_description = st.text_area(
+            "Job description",
+            height=200,
+            placeholder="Paste the full posting here...",
+        )
+
+    # ── Analyze button ──
+    if st.button("🚀 Analyze Match", type="primary", use_container_width=True):
         if not uploaded_file:
             st.error("Please upload a resume first.")
             return
@@ -237,7 +74,10 @@ def main():
             st.error("Please paste a job description.")
             return
 
-        with st.spinner("Analyzing your resume..."):
+        with st.spinner(
+            "🔍 Analyzing your resume — extracting skills, rewriting bullets, "
+            "generating interview questions... This may take 15-30 seconds."
+        ):
             try:
                 resume_text = extract_text(uploaded_file)
                 result = analyze_resume(resume_text, job_description, api_key)
